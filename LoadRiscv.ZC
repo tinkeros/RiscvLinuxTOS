@@ -1,0 +1,733 @@
+
+#define RiscvMAX_HEAP_SIZE    0x10000000
+#define RiscvMAX_FDS          16
+#define RiscvALIGN_SIZE       0x1000
+#define PY_STR_MAX             1024
+#define PY_ARG_MAX             16
+
+U64 *RiscvBase;
+U64 *RiscvArgv = NULL;
+U64 *RiscvRestore_SP;
+U8 *true_base = NULL;
+U8 *base_copy = NULL;
+U8 *tmp_py_str = NULL;
+U8 *table_entry;
+U64 RiscvArgc;
+U64 RiscvBreak_Start;
+U64 RiscvBreak_End;
+U64 RiscvProgram_Start;
+U64 RiscvProgram_End;
+U8 *RiscvInterp = NULL;
+CFPU *fpu_state=NULL;
+
+U8 *StartDir=DirCur;
+CDoc *RiscvPut=NULL;
+CFifoU8 *uart_fifo=FifoU8New(1024);
+
+U8 GetUartFifo()
+{
+  U8 ch=NONE;
+  if (FifoU8Count(uart_fifo))
+    {
+    FifoU8Remove(uart_fifo,&ch);
+    return ch;
+  }
+  return 0;
+}
+
+
+U0 FPUContextSave()
+{
+asm {
+PUSH RAX
+MOV     RAX,U64 fpu_state
+FXSAVE U64 [RAX]
+POP RAX
+}
+}
+
+U0 FPUContextRestore()
+{
+asm {
+PUSH RAX
+MOV     RAX,U64 fpu_state
+FXRSTOR U64 [RAX]
+POP RAX
+}
+}
+
+
+class RiscvFD
+{
+  CFile *f;
+  U64 position;
+  Bool write;
+};
+
+RiscvFD *RiscvFD_Handle = NULL;
+
+class RiscvProgramHeader
+{
+  U64 start;
+  U64 syscall_address;
+  U64 fini_address;
+  U64 end_address;
+  U64 load_size;
+  U64 total_size;
+  U8 pad[BLK_SIZE - (6 * 8)];
+};
+
+RiscvProgramHeader header;
+
+U0 RiscvExit()
+{
+  FPUContextRestore;
+  asm
+  {
+    MOV RCX, I64[&RiscvRestore_SP]
+    MOV RSP, RCX
+    POP_REGS
+    POP RBP
+  }
+}
+
+U8 * RiscvTo_Ptr(U64 p0)
+{
+  U8 *rc;
+  MemCopy (&rc, &p0, 8);
+  return rc;
+}
+
+U64 RiscvTo_Int(U8 * p0)
+{
+  U64 rc;
+  MemCopy (&rc, &p0, 8);
+  return rc;
+}
+
+U0 RiscvRead_Write_Common(Bool write, U64 fd, U8 * rbuf, U64 rsize)
+{
+  U64 blk_copy, blk_offset, i, num_blocks;
+  U8 tmp[BLK_SIZE];
+
+  num_blocks = (FSize (RiscvFD_Handle[fd].f) + BLK_SIZE - 1) / BLK_SIZE;
+
+  for (i = RiscvFD_Handle[fd].position / BLK_SIZE; rsize > 0; i++)
+    {
+
+      if (i < num_blocks)
+	{
+	  if (!FBlkRead (RiscvFD_Handle[fd].f, tmp, i, 1))
+	    {
+	      RiscvExit;
+	    }
+	}
+      else
+	{
+	  MemSet (tmp, 0, BLK_SIZE);
+	}
+      blk_offset = RiscvFD_Handle[fd].position - (i * BLK_SIZE);
+      blk_copy = rsize;
+      if (rsize > (BLK_SIZE - blk_offset))
+	{
+	  blk_copy = BLK_SIZE - blk_offset;
+	}
+
+      if (write)
+	{
+	  MemCopy (RiscvTo_Ptr (RiscvTo_Int (tmp) + blk_offset), rbuf,
+		  blk_copy);
+
+	  if (!FBlkWrite (RiscvFD_Handle[fd].f, tmp, i, 1))
+	    {
+	      RiscvExit;
+	    }
+	}
+      else
+	{
+	  MemCopy (rbuf, RiscvTo_Ptr (RiscvTo_Int (tmp) + blk_offset),
+		  blk_copy);
+	}
+      RiscvFD_Handle[fd].position += blk_copy;
+      rsize -= blk_copy;
+      rbuf = RiscvTo_Ptr (RiscvTo_Int (rbuf) + blk_copy);
+    }
+}
+
+
+U64 RiscvSyscallRead(U64 fd, U8 * buf, U64 size)
+{
+  U64 remaining, total_size;
+
+  if (size == 0)
+    {
+      return 0;
+    }
+  if (fd == 0)
+    {
+      U64 x = StrNGet (buf, size);
+      buf[x] = '\n';
+      return x + 1;
+    }
+  if ((fd >= RiscvMAX_FDS) || (RiscvFD_Handle[fd].f == NULL))
+    {
+      RiscvExit;
+    }
+  total_size = FSize (RiscvFD_Handle[fd].f);
+  if (total_size >= RiscvFD_Handle[fd].position)
+    {
+      remaining = total_size - RiscvFD_Handle[fd].position;
+    }
+  else
+    {
+      remaining = 0;
+    }
+  if (size > remaining)
+    {
+      size = remaining;
+    }
+
+  RiscvRead_Write_Common (FALSE, fd, buf, size);
+  return size;
+}
+
+U64 RiscvSyscallWrite(U64 fd, U8 * buf, U64 size)
+{
+  U64 i;
+  if ((fd == 0) || (fd >= RiscvMAX_FDS)
+      || ((fd > 2)
+	  && ((RiscvFD_Handle[fd].f == NULL)
+	      || (!RiscvFD_Handle[fd].write))))
+    {
+
+      RiscvExit;
+    }
+  if (fd <= 2)
+    {
+      for (i = 0; i < size; i++)
+	{
+	  if (RiscvPut)
+	    {
+	      if (buf[i] == 0x0a)
+		{
+		  DocPrint (RiscvPut, "\n");
+		}
+	      else if (buf[i] != 0x0d)
+		{
+		  U8 tmp[2];
+		  tmp[0] = buf[i];
+		  tmp[1] = 0;
+		  DocPrint (RiscvPut, tmp);
+		}
+	    }
+	  else
+	    {
+	      if (buf[i] == 0x0a)
+		{
+		  "\n";
+		}
+	      else if (buf[i] != 0x0d)
+		{
+		  '' buf[i];
+		}
+	    }
+	}
+      return size;
+    }
+  Yield;
+  RiscvRead_Write_Common (TRUE, fd, buf, size);
+  return size;
+}
+
+U64 RiscvSyscallOpen_FD(Bool write, CFile * f)
+{
+  I64 fd, i;
+
+  if (!f)
+    {
+      return -2;
+    }
+  fd = -24;			// EMFILE
+  for (i = 3; i < RiscvMAX_FDS; i++)
+    {
+      if (RiscvFD_Handle[i].f == NULL)
+	{
+	  fd = i;
+	  break;
+	}
+    }
+  if (fd < 0)
+    {
+      FClose (f);
+      return fd;		// EMFILE, too many open files
+    }
+  RiscvFD_Handle[fd].position = 0;
+  RiscvFD_Handle[fd].write = write;
+  RiscvFD_Handle[fd].f = f;
+
+  return fd;
+}
+
+U64 RiscvSyscallOpen(U8 * buf, U64 mode)
+{
+  CFile *f;
+  switch (mode & 3)
+    {
+    case 0x0:
+      return RiscvSyscallOpen_FD (FALSE, FOpen (buf, "r"));
+    case 0x1:
+      switch (mode)
+	{
+	case 0x241:
+	  f = FOpen (buf, "r");
+	  if (f)
+	    {
+	      FClose (f);
+	      Del (buf);
+	    }
+	  return RiscvSyscallOpen_FD (TRUE, FOpen (buf, "w+"));
+	default:
+	  break;
+	}
+    default:
+      break;
+    }
+  RiscvExit;
+}
+
+U64 RiscvSyscallClose(U64 fd)
+{
+  if ((fd >= RiscvMAX_FDS) || (fd <= 2) || (RiscvFD_Handle[fd].f == NULL))
+    {
+      RiscvExit;
+    }
+  FClose (RiscvFD_Handle[fd].f);
+  RiscvFD_Handle[fd].f = NULL;
+  RiscvFD_Handle[fd].position = 0;
+  return 0;
+}
+
+U64 RiscvSyscallLSeek(U64 fd, I64 offset, U64 whence)
+{
+  if ((fd >= RiscvMAX_FDS) || (fd <= 2) || (RiscvFD_Handle[fd].f == NULL))
+    {
+      RiscvExit;
+    }
+  switch (whence)
+    {
+    case 0:
+      break;
+    case 1:
+      offset += RiscvFD_Handle[fd].position;
+      break;
+    case 2:
+      offset += FSize (RiscvFD_Handle[fd].f);
+      break;
+    default:
+      RiscvExit;
+    }
+  if ((offset < 0) || (offset > FSize (RiscvFD_Handle[fd].f)))
+    {
+      return -22;
+    }
+  RiscvFD_Handle[fd].position = offset;
+  return offset;
+}
+
+U64 RiscvSyscallFStat(U64 fd, U64 * stat)
+{
+  if ((fd >= RiscvMAX_FDS) || (fd <= 2) || (RiscvFD_Handle[fd].f == NULL))
+    {
+      RiscvExit;
+    }
+  MemSet (stat, 0, 144);
+  stat[6] = FSize (RiscvFD_Handle[fd].f);
+  return 0;
+}
+
+I64 SDir(U8 *files_find_mask)
+{
+Bool res,old_silent=Silent;
+res=Dir(files_find_mask);
+Silent(old_silent);
+  return res;
+}
+
+
+U64 RiscvSyscallStat(U8 * path, U64 * stat)
+{
+  MemSet (stat, 0, 144);
+  if (IsDir(path)>0) {
+      stat[0]=1;
+  }
+  if (SDir(path)>0) {
+      stat[1]=1;
+  }
+  return 0;
+}
+
+U64 RiscvSyscallBrk(U64 pos)
+{
+  if (pos < RiscvBreak_Start)
+    {
+      pos = RiscvBreak_Start;
+    }
+  if (pos > RiscvBreak_End)
+    {
+      pos = RiscvBreak_End;
+    }
+  return pos;
+}
+
+U64 RiscvGetTimeOfDay(U64 * timeval, U64 * timezone)
+{
+  if (timeval)
+    {
+      MemSet (timeval, 0, 16);
+      timeval[0] = 1569517285;
+    }
+  if (timezone)
+    {
+      MemSet (timezone, 0, 8);
+    }
+  return 0;
+}
+
+U64 RiscvSyscall(U64 num, U64 p0, U64 p1, U64 p2, U64 p3, U64 p4)
+{
+  no_warn p3;
+  no_warn p4;
+  switch (num)
+    {
+    case 0:
+      return RiscvSyscallRead (p0, RiscvTo_Ptr (p1), p2);
+    case 1:
+      return RiscvSyscallWrite (p0, RiscvTo_Ptr (p1), p2);
+    case 2:
+      return RiscvSyscallOpen (RiscvTo_Ptr (p0), p1);
+    case 3:
+      return RiscvSyscallClose (p0);
+    case 5:
+      return RiscvSyscallFStat (p0, RiscvTo_Ptr (p1));
+    case 8:
+      return RiscvSyscallLSeek (p0, p1, p2);
+    case 12:
+      return RiscvSyscallBrk (p0);
+    case 4:
+      return RiscvSyscallStat (RiscvTo_Ptr(p0), RiscvTo_Ptr (p1));
+    case 13:
+      return 0;
+    case 79:
+      return 0;
+    case 89:
+      return 0;
+    case 16:
+      if (p1 == 0x5401)
+        {
+        return 0;
+      }
+      else
+        {
+        RiscvExit;
+        return 0;
+      }
+    case 60:
+      RiscvExit;
+      return 0;
+    case 201:
+      return 1569517285;
+    case 96:
+      return RiscvGetTimeOfDay (p0, p1);
+    case 2000:
+      Yield;
+      return 0;
+    case 2001:
+      Yield;
+      return GetUartFifo;
+    default:
+      "Got unknown syscall, exiting!\n";
+      RiscvExit;
+      return 0;
+  }
+  return 0;
+}
+
+U0 RiscvLaunch()
+{
+  FPUContextSave;
+  asm
+  {
+  PUSH RBP
+      MOV RBP, RSP
+      PUSH_REGS
+      MOV RCX, RSP
+      MOV I64[&RiscvRestore_SP], RCX
+      MOV RDI, I64[&RiscvArgc]
+      MOV RSI, I64[&RiscvArgv]
+      MOV RCX, I64[&RiscvBase]
+      CALL RCX
+      HLT
+  }
+}
+
+U0 RiscvSyscallPoint()
+{
+  asm
+  {
+      PUSH_REGS
+      PUSH R9
+      PUSH R8
+      PUSH RCX
+      PUSH RDX
+      PUSH RSI
+      PUSH RDI
+      CALL &RiscvSyscall
+      MOV I64[RSP + 112], RAX
+      POP_REGS
+  }
+}
+
+
+U8 *RiscvPath = DirCur;
+U8 *program = MStrPrint("%s/riscv_em.prg",RiscvPath);
+
+
+Bool ReadProgramHeader()
+{
+
+  CFile *f = FOpen (program, "r");
+  if (!f)
+    {
+      return FALSE;
+    }
+  if (!FBlkRead (f, &header, 0, 1))
+    {
+      return FALSE;
+    }
+  FClose (f);
+}
+
+ReadProgramHeader;
+
+U64 ldr_offset;
+
+U0 RiscvInit()
+{
+
+  fpu_state=MAllocAligned(sizeof(CFPU),0x10);
+
+  if (!fpu_state) {
+    "Failed to malloc memory for FPU state!\n";
+    return;
+  }
+
+  true_base =
+    MAlloc (RiscvMAX_HEAP_SIZE + header.total_size + RiscvALIGN_SIZE);
+
+  if (!true_base)
+  {
+      "Failed to malloc enough memory!\n";
+      return;
+  }
+
+  tmp_py_str = MAlloc(PY_STR_MAX);
+
+  if (!tmp_py_str)
+  {
+      "Failed to malloc enough memory!\n";
+      return;
+  }
+
+  RiscvArgv = MAlloc ((PY_ARG_MAX * 8) + 64);
+
+  if (!RiscvArgv)
+  {
+      "Failed to malloc enough memory!\n";
+      return;
+  }
+
+  RiscvFD_Handle = MAlloc(RiscvMAX_FDS*sizeof(RiscvFD));
+
+  if (!RiscvFD_Handle)
+  {
+      "Failed to malloc enough memory!\n";
+      return;
+  }
+
+  RiscvInterp = MStrPrint ("%s/mpython.bin",RiscvPath);
+
+  ldr_offset = RiscvTo_Int (true_base);
+  ldr_offset = (ldr_offset + RiscvALIGN_SIZE - 1) / RiscvALIGN_SIZE;
+  ldr_offset *= RiscvALIGN_SIZE;
+  RiscvBase = RiscvTo_Ptr (ldr_offset);
+  base_copy = RiscvTo_Ptr (ldr_offset);
+
+  RiscvBreak_Start = header.end_address + ldr_offset;
+  RiscvBreak_End = header.total_size + RiscvMAX_HEAP_SIZE + ldr_offset;
+
+  RiscvProgram_Start = ldr_offset;
+  RiscvProgram_End = ldr_offset + header.fini_address;
+
+}
+
+Bool LoadProgramToMemory()
+{
+
+  U8 *file_entry;
+  U32 reloc;
+  U64 i, tmp;
+  U64 num_blocks;
+
+  MemSet (true_base, 0x0,
+	  RiscvMAX_HEAP_SIZE + header.total_size + RiscvALIGN_SIZE);
+
+  CFile *f = FOpen (program, "r");
+  if (!f)
+    {
+      return FALSE;
+    }
+
+  num_blocks = (header.total_size + BLK_SIZE - 1) / BLK_SIZE;
+
+  for (i = 0; i < num_blocks; i++)
+    {
+      file_entry = base_copy + (i * BLK_SIZE);
+      if (!FBlkRead (f, file_entry, i, 1))
+	{
+	  return FALSE;
+	}
+    }
+  FClose (f);
+
+  for (i = header.load_size; i < header.total_size; i += 4)
+    {
+      table_entry = base_copy + i;
+      MemCopy (&reloc, table_entry, 4);
+      if (reloc >= (header.load_size / 8))
+	{
+	  return FALSE;
+	}
+      reloc = reloc * 8;
+      MemCopy (&tmp, base_copy + reloc, 8);
+      tmp += ldr_offset;
+      MemCopy (base_copy + reloc, &tmp, 8);
+    }
+
+  RiscvBase[1] = &RiscvSyscallPoint;
+  return TRUE;
+}
+
+
+U0 RiscvDeinit()
+{
+  Free(RiscvInterp);
+  Free(true_base);
+  Free(RiscvArgv);
+  Free(tmp_py_str);
+  Free(RiscvFD_Handle);
+  Free(fpu_state);
+}
+
+U64 RiscvInitCheck()
+{
+  return ((!RiscvInterp) || (!true_base) || (!RiscvArgv) || (!tmp_py_str) || (!RiscvFD_Handle));
+}
+
+U64 RiscvEm(...)
+{
+
+  U64 i;
+
+  if (RiscvInitCheck())
+  {
+      RiscvInit;
+      if (RiscvInitCheck())
+      {
+      "Error allocating memory for Riscv!\n";
+      return 1;
+      }
+  }
+
+  LoadProgramToMemory;
+
+  table_entry = base_copy + header.load_size;
+  MemSet (table_entry, 0, header.total_size - header.load_size);
+
+
+  if ( argc > PY_ARG_MAX ) {
+      "Too many arguments!\n";
+      return 1;
+  }
+
+  MemSet (RiscvArgv, 0x00, (argc * 8) + 64);
+  RiscvArgc = argc + 1;
+  for (i = 0; i < argc; i++)
+    {
+      RiscvArgv[i + 1] = RiscvTo_Ptr (argv[i]);
+    }
+  for (i = 0; i < RiscvMAX_FDS; i++)
+    {
+      RiscvFD_Handle[i].f = NULL;
+      RiscvFD_Handle[i].position = 0;
+      RiscvFD_Handle[i].write = FALSE;
+    }
+
+  RiscvLaunch;
+
+  for (i = 0; i < RiscvMAX_FDS; i++)
+    {
+      if (RiscvFD_Handle[i].f != NULL)
+	{
+	  RiscvSyscallClose (i);
+	}
+    }
+  return TRUE;
+}
+
+
+U0 EmuTask(U8 *data)
+{
+  RiscvPut=data;
+  Cd(StartDir);
+  RiscvEm("-f","loader_64.bin","-d","riscv_em.dtb");
+}
+
+
+U0 RiscvMain()
+{
+  Bool quit=FALSE;
+  I64 ch,sc;
+
+  CTask *emu;
+  AutoComplete(0);
+  WinMax;
+  DocClear;
+
+  PopUpOk("Wait for the following login prompt to start typing:\n\n"
+          "Welcome to Buildroot\n"
+          "buildroot login:\n\n"
+          "Booting will take awhile, be patient.\n\n"
+          "Login as root (no password needed)\n\n"
+          "Only printable keys work, delete/backspace do not.\n\n"
+          "Some commands like ls output terminal control characters\n"
+          "which look like numbers] to avoid this pipe into strings:\n\n"
+          "ls | strings\n\n"
+          "To exit, press SHIFT-ESC\n\n");
+  emu=Spawn(&EmuTask,Fs->put_doc);
+    while (!quit && TaskValidate(emu)) {
+      ch = KeyGet(&sc);
+      switch (ch) {
+        case CH_SHIFT_ESC:
+          quit=TRUE;
+          break;
+        default:
+          if (ch)
+          {
+            FifoU8Insert(uart_fifo,ch);
+          }
+          break;
+    }
+  }
+  Kill(emu);
+  RiscvPut=NULL;
+}

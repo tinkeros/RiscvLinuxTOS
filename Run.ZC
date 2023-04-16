@@ -1,0 +1,4 @@
+#include "C:/Riscv/LoadRiscv.ZC"
+
+RiscvMain;
+
