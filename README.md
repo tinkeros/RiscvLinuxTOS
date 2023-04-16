@@ -2,6 +2,8 @@
 
 Riscv Emulator running Linux on TinkerOS/ZealOS
 
+<center><img src="https://raw.githubusercontent.com/tinkeros/RiscvLinuxTOS/master/Screenshot.png"></img></center>
+
 ### Files description:
 - `*.HC` HolyC files, use these to run on TinkerOS.
 - `*.ZC` Files to run on ZealOS instead.
@@ -11,6 +13,8 @@ Riscv Emulator running Linux on TinkerOS/ZealOS
 
 Don't expect to do anything useful with this, I made it for fun, mostly just so I could simply say I booted Linux on TempleOS/TinkerOS/ZealOS.
 
-You do not have real a terminal/tty so don't expect interactive commands to work, but non-interactive text applications and shell commands should work fine.
+You do not have a real terminal/tty so don't expect interactive commands to work.  Non-interactive text applications and shell commands should work fine provided they do not require keys which are non-printable.
 
 There is no support for graphics, networking, or access to the host TinkerOS/ZealOS filesystem.  The only things you can access are things on the pre-built root filesystem.
+
+This is just a demo and unlikely to evolve further functionality.
